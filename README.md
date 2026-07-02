@@ -124,9 +124,12 @@ Part of the **tiny-*** zero-dep stack by [OpenClaw](https://github.com/hussain-a
 | [tiny-agent](https://github.com/hussain-alsaibai/tiny-agent) | Zero-dep agent framework |
 | [tiny-mcp](https://github.com/hussain-alsaibai/tiny-mcp) | Model Context Protocol server |
 | [tiny-embed](https://github.com/hussain-alsaibai/tiny-embed) | Embeddings + vector search |
+| [tiny-compose](https://github.com/hussain-alsaibai/tiny-compose) | Stack any decorators in any order, declaratively |
+| [tiny-trace](https://github.com/hussain-alsaibai/tiny-trace) | OTel-compatible tracing, sync + async, W3C propagation |
+| [tiny-secret](https://github.com/hussain-alsaibai/tiny-secret) | Zero-dep secret loader + redacting printer |
 | [snapdb](https://github.com/hussain-alsaibai/snapdb) | Embedded DB (Python) |
 
-**Total: 12 repos, ~5,200 LOC, zero deps across the entire stack.**
+**Total: 15 repos, ~6,400 LOC, zero deps across the entire stack.**
 
 ## License
 
