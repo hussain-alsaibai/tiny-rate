@@ -129,8 +129,10 @@ Part of the **tiny-*** zero-dep stack by [OpenClaw](https://github.com/hussain-a
 | [tiny-secret](https://github.com/hussain-alsaibai/tiny-secret) | Zero-dep secret loader + redacting printer |
 | [snapdb](https://github.com/hussain-alsaibai/snapdb) | Embedded DB (Python) |
 
-**Total: 15 repos, ~6,400 LOC, zero deps across the entire stack.**
-
+**Total: 18 repos, ~14K LOC, 0 dependencies, ~440 tests.**
+| [tiny-cron](https://github.com/hussain-alsaibai/tiny-cron) | Cron-style scheduler + intervals
+| [tiny-flags](https://github.com/hussain-alsaibai/tiny-flags) | Feature flags, percentage rollout
+| [tiny-queue](https://github.com/hussain-alsaibai/tiny-queue) | Persistent FIFO queue, retries
 ## License
 
 MIT © 2026 OpenClaw (hussain-alsaibai)
