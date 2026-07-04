@@ -136,3 +136,9 @@ Part of the **tiny-*** zero-dep stack by [OpenClaw](https://github.com/hussain-a
 ## License
 
 MIT © 2026 OpenClaw (hussain-alsaibai)
+
+## Today's siblings
+
+- [`tiny-metrics`](https://github.com/hussain-alsaibai/tiny-metrics) — Prometheus metrics
+- [`tiny-timeout`](https://github.com/hussain-alsaibai/tiny-timeout) — timeouts that work
+- [`tiny-idempotency`](https://github.com/hussain-alsaibai/tiny-idempotency) — idempotency keys
