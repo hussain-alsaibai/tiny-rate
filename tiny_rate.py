@@ -22,12 +22,15 @@ import threading
 import time
 from typing import Any, Awaitable, Callable, List, Optional, Tuple, TypeVar, Union
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "TokenBucket",
     "FixedWindow",
     "SlidingWindow",
+    "LeakyBucket",
+    "RedisBackend",
     "RateLimitExceeded",
+    "RateMetrics",
     "limit",
     "alimit",
     "parse_rate",
@@ -438,6 +441,400 @@ class SlidingWindow:
 
     def __repr__(self) -> str:
         return f"SlidingWindow(rate={self.rate}/period, period={self.period:.4f}s)"
+
+
+# ---------------------------------------------------------------------------
+# Leaky Bucket — constant drain rate, no burst
+# ---------------------------------------------------------------------------
+
+
+class LeakyBucket:
+    """Leaky-bucket rate limiter.
+
+    Unlike TokenBucket (which smooths by capping burst), LeakyBucket enforces
+    a hard ceiling on concurrent in-flight items. Items "leak" out at a fixed
+    rate. When the bucket is full, new acquisitions are rejected.
+
+    Args:
+        rate:        Leak rate: max items allowed through per second (float).
+        capacity:    Bucket size — max concurrent items (int). Default = rate.
+
+    Thread-safe.
+
+    Example:
+        # Allow 10 concurrent connections, leak at 5/s
+        lb = LeakyBucket(rate=5, capacity=10)
+        if lb.try_acquire():
+            handle_connection()
+    """
+
+    __slots__ = ("rate", "capacity", "_in_flight", "_last_leak", "_lock")
+
+    def __init__(self, rate: float, capacity: Optional[int] = None) -> None:
+        if rate <= 0:
+            raise ValueError("rate must be positive")
+        cap = int(capacity) if capacity is not None else max(1, int(rate))
+        if cap <= 0:
+            raise ValueError("capacity must be positive")
+        self.rate = float(rate)
+        self.capacity = cap
+        self._in_flight = 0
+        self._last_leak = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _drip_locked(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_leak
+        if elapsed > 0:
+            leaked = elapsed * self.rate
+            self._in_flight = max(0, self._in_flight - leaked)
+            self._last_leak = now
+
+    def try_acquire(self) -> bool:
+        """Attempt to add one item to the bucket. Returns True if accepted."""
+        with self._lock:
+            self._drip_locked()
+            if self._in_flight < self.capacity:
+                self._in_flight += 1
+                return True
+            return False
+
+    def acquire(self, timeout: Optional[float] = None) -> None:
+        """Block until a slot opens (item leaks out)."""
+        if timeout == 0:
+            with self._lock:
+                self._drip_locked()
+                if self._in_flight < self.capacity:
+                    self._in_flight += 1
+                    return
+                wait = 1.0 / self.rate
+                raise RateLimitExceeded(wait)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            with self._lock:
+                self._drip_locked()
+                if self._in_flight < self.capacity:
+                    self._in_flight += 1
+                    return
+                wait = 1.0 / self.rate
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RateLimitExceeded(wait)
+                wait = min(wait, remaining)
+            time.sleep(wait)
+
+    async def aacquire(self, timeout: Optional[float] = None) -> None:
+        """Async acquire — blocks until a slot opens."""
+        if timeout == 0:
+            with self._lock:
+                self._drip_locked()
+                if self._in_flight < self.capacity:
+                    self._in_flight += 1
+                    return
+                wait = 1.0 / self.rate
+                raise RateLimitExceeded(wait)
+        loop = asyncio.get_event_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        while True:
+            with self._lock:
+                self._drip_locked()
+                if self._in_flight < self.capacity:
+                    self._in_flight += 1
+                    return
+                wait = 1.0 / self.rate
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise RateLimitExceeded(wait)
+                wait = min(wait, remaining)
+            await asyncio.sleep(wait)
+
+    def release(self) -> None:
+        """Manually release one slot (call when work completes)."""
+        with self._lock:
+            self._drip_locked()
+            self._in_flight = max(0, self._in_flight - 1)
+
+    def in_flight(self) -> int:
+        """Current in-flight count."""
+        with self._lock:
+            self._drip_locked()
+            return int(self._in_flight)
+
+    def __repr__(self) -> str:
+        return f"LeakyBucket(rate={self.rate}/s, capacity={self.capacity})"
+
+
+# ---------------------------------------------------------------------------
+# Redis Backend — distributed rate limiting
+# ----------------------------------------------------------------------------
+
+
+class RedisBackend:
+    """Distributed rate limiter backed by Redis.
+
+    Uses a Lua script for atomic check-and-increment so there are no race
+    conditions between acquire calls. Works across multiple processes or hosts.
+
+    Supports token-bucket and sliding-window algorithms in Redis.
+
+    Args:
+        redis_url:  Redis URL (e.g. "redis://localhost:6379/0").
+                    If None, defers connection until first call.
+        key:        Key prefix for rate limit counters. Default "ratelimit".
+
+    Example:
+        backend = RedisBackend("redis://localhost:6379/0")
+        await backend.acquire("api:user:42", limit=100, window=60.0)
+
+    Note:
+        Requires the ``redis`` package (``pip install redis``). Not installed
+        by default — import is lazy.
+    """
+
+    __slots__ = ("_redis", "_url", "_key")
+
+    def __init__(
+        self,
+        redis_url: Optional[str] = None,
+        key: str = "ratelimit",
+    ) -> None:
+        self._redis: Optional[Any] = None
+        self._url = redis_url or "redis://localhost:6379/0"
+        self._key = key
+
+    def _connect(self) -> Any:
+        if self._redis is None:
+            try:
+                import redis  # type: ignore
+            except ImportError:
+                raise RuntimeError(
+                    "RedisBackend requires the 'redis' package. "
+                    "Install with: pip install redis"
+                )
+            self._redis = redis.from_url(self._url, decode_responses=False)
+        return self._redis
+
+    # Lua script: token-bucket in Redis (atomic)
+    # KEYS[1] = key, ARGV[1] = limit, ARGV[2] = window_sec, ARGV[3] = now_ms
+    _TB_SCRIPT = """
+        local key = KEYS[1]
+        local limit = tonumber(ARGV[1])
+        local window = tonumber(ARGV[2])
+        local now = tonumber(ARGV[3])
+        local bucket = redis.call('HMGET', key, 'tokens', 'last')
+        local tokens = tonumber(bucket[1]) or limit
+        local last = tonumber(bucket[2]) or now
+        local rate = limit / window
+        local elapsed = (now - last) / 1000.0
+        tokens = math.min(limit, tokens + elapsed * rate)
+        if tokens >= 1.0 then
+            tokens = tokens - 1.0
+            redis.call('HMSET', key, 'tokens', tokens, 'last', now)
+            redis.call('EXPIRE', key, math.ceil(window * 2))
+            return 1
+        else
+            redis.call('HMSET', key, 'tokens', tokens, 'last', now)
+            redis.call('EXPIRE', key, math.ceil(window * 2))
+            return 0
+        end
+    """
+
+    # Lua script: sliding-window in Redis
+    # KEYS[1] = key, ARGV[1] = limit, ARGV[2] = window_sec, ARGV[3] = now_ms
+    _SW_SCRIPT = """
+        local key = KEYS[1]
+        local limit = tonumber(ARGV[1])
+        local window = tonumber(ARGV[2])
+        local now = tonumber(ARGV[3])
+        local window_ms = window * 1000
+        local cutoff = now - window_ms
+        redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
+        local count = redis.call('ZCARD', key)
+        if count < limit then
+            redis.call('ZADD', key, now, now .. ':' .. math.random(1000000))
+            redis.call('EXPIRE', key, math.ceil(window * 2))
+            return 1
+        else
+            return 0
+        end
+    """
+
+    def acquire(
+        self,
+        key: str,
+        limit: int,
+        window: float,
+        algorithm: str = "token",
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Synchronous Redis acquire. Returns True if allowed, False if rejected.
+
+        ``algorithm``: ``"token"`` (default) or ``"sliding"``.
+        ``timeout``: seconds to retry acquiring. Default None (no retry).
+        """
+        r = self._connect()
+        script = self._TB_SCRIPT if algorithm == "token" else self._SW_SCRIPT
+        full_key = f"{self._key}:{key}"
+        now_ms = int(time.time() * 1000)
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            result = r.eval(script, 1, full_key, limit, window, now_ms)
+            if result == 1:
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    async def aacquire(
+        self,
+        key: str,
+        limit: int,
+        window: float,
+        algorithm: str = "token",
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Async Redis acquire. ``timeout`` seconds to retry."""
+        r = self._connect()
+        script = self._TB_SCRIPT if algorithm == "token" else self._SW_SCRIPT
+        full_key = f"{self._key}:{key}"
+        now_ms = int(time.time() * 1000)
+
+        deadline = None if timeout is None else asyncio.get_event_loop().time() + timeout
+        while True:
+            result = await asyncio.to_thread(r.eval, script, 1, full_key, limit, window, now_ms)
+            if result == 1:
+                return True
+            if deadline is not None and asyncio.get_event_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+
+    def check(self, key: str) -> int:
+        """Return current count for a key (sliding window)."""
+        r = self._connect()
+        full_key = f"{self._key}:{key}"
+        return r.zcard(full_key) or 0
+
+    def reset(self, key: str) -> None:
+        """Reset counter for a key."""
+        r = self._connect()
+        full_key = f"{self._key}:{key}"
+        r.delete(full_key)
+
+    def close(self) -> None:
+        """Close Redis connection."""
+        if self._redis:
+            self._redis.close()
+            self._redis = None
+
+
+# ---------------------------------------------------------------------------
+# Metrics — Prometheus-compatible hit/miss/latency tracking
+# ---------------------------------------------------------------------------
+
+
+class RateMetrics:
+    """Lightweight metrics collector for rate limiter performance.
+
+    Thread-safe counters for hits, misses, wait time, and errors.
+    Prometheus-compatible exposition format via ``.prometheus()``.
+
+    Example:
+        metrics = RateMetrics()
+        bucket = tr.TokenBucket(rate=10, capacity=10)
+
+        for req in requests:
+            if bucket.try_acquire():
+                metrics.hit()
+                handle(req)
+            else:
+                metrics.miss()
+                reject(req)
+
+        print(metrics.prometheus())   # paste into /metrics endpoint
+    """
+
+    __slots__ = ("_hits", "_misses", "_errors", "_total_wait_us", "_lock")
+
+    def __init__(self) -> None:
+        self._hits = 0
+        self._misses = 0
+        self._errors = 0
+        self._total_wait_us = 0
+        self._lock = threading.Lock()
+
+    def hit(self, wait_us: int = 0) -> None:
+        with self._lock:
+            self._hits += 1
+            self._total_wait_us += wait_us
+
+    def miss(self) -> None:
+        with self._lock:
+            self._misses += 1
+
+    def error(self) -> None:
+        with self._lock:
+            self._errors += 1
+
+    @property
+    def total(self) -> int:
+        with self._lock:
+            return self._hits + self._misses
+
+    @property
+    def hit_rate(self) -> float:
+        with self._lock:
+            total = self._hits + self._misses
+            return self._hits / total if total > 0 else 0.0
+
+    @property
+    def avg_wait_ms(self) -> float:
+        with self._lock:
+            return self._total_wait_us / self._hits / 1000.0 if self._hits > 0 else 0.0
+
+    def prometheus(self) -> str:
+        """Return Prometheus exposition text format."""
+        with self._lock:
+            hits = self._hits
+            misses = self._misses
+            errors = self._errors
+            wait_us = self._total_wait_us
+        total = hits + misses
+        return (
+            f"# HELP ratelimit_hits_total Total allowed acquisitions\n"
+            f"# TYPE ratelimit_hits_total counter\n"
+            f"ratelimit_hits_total {hits}\n"
+            f"# HELP ratelimit_misses_total Total rejected acquisitions\n"
+            f"# TYPE ratelimit_misses_total counter\n"
+            f"ratelimit_misses_total {misses}\n"
+            f"# HELP ratelimit_errors_total Total errors\n"
+            f"# TYPE ratelimit_errors_total counter\n"
+            f"ratelimit_errors_total {errors}\n"
+            f"# HELP ratelimit_requests_total Total requests\n"
+            f"# TYPE ratelimit_requests_total counter\n"
+            f"ratelimit_requests_total {total}\n"
+            f"# HELP ratelimit_hit_rate Ratio of hits to total\n"
+            f"# TYPE ratelimit_hit_rate gauge\n"
+            f"ratelimit_hit_rate {self.hit_rate:.6f}\n"
+            f"# HELP ratelimit_avg_wait_ms Average wait time in milliseconds\n"
+            f"# TYPE ratelimit_avg_wait_ms gauge\n"
+            f"ratelimit_avg_wait_ms {self.avg_wait_ms:.6f}\n"
+        )
+
+    def summary(self) -> Dict[str, Any]:
+        """Return dict for JSON export."""
+        with self._lock:
+            total = self._hits + self._misses
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "errors": self._errors,
+            "total": total,
+            "hit_rate": round(self.hit_rate, 6),
+            "avg_wait_ms": round(self.avg_wait_ms, 4),
+        }
 
 
 # ---------------------------------------------------------------------------

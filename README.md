@@ -1,10 +1,18 @@
 # tiny-rate
 
-> Zero-dependency rate limiter for Python. Token bucket, fixed window, sliding window — sync + async, decorator-friendly.
+> Zero-dependency rate limiter for Python. Four algorithms — sync + async, decorator-friendly, now with Redis and Prometheus metrics.
 
 ```bash
-pip install tiny-rate   # coming soon
+pip install tiny-rate
 ```
+
+![version 0.2.0](https://img.shields.io/badge/version-0.2.0-blue)
+
+## What's new in v0.2
+
+- **LeakyBucket** — constant drain rate, no burst. Perfect for connection pools and concurrent request gates.
+- **RedisBackend** — distributed rate limiting across multiple processes/hosts via Lua scripts. Token-bucket and sliding-window in Redis.
+- **RateMetrics** — Prometheus-compatible hit/miss/error counters and wait-time tracking.
 
 ## Why?
 
@@ -15,17 +23,18 @@ Every API needs rate limiting. The standard options are all heavy:
 - **`aiolimiter`** — async-only, single algorithm
 - **`slowapi`** — wraps `limits`, FastAPI-specific
 
-**tiny-rate** is a single file with three algorithms and one decorator, sync or async, 350 LOC.
+**tiny-rate** is a single file with four algorithms and one decorator, sync or async, ~600 LOC.
 
-## What's included
+## Algorithms
 
-| Algorithm | Burst | Smoothness | Use when |
-|-----------|-------|-----------|----------|
-| **TokenBucket** | ✅ (configurable) | Smooth | APIs with burst tolerance |
-| **FixedWindow** | ❌ (2x at edge) | Stepped | Simple quotas, dashboards |
-| **SlidingWindow** | ❌ (exact) | Exact | Strict SLOs, audit logs |
+| Algorithm | Burst | Smoothness | Distributed | Use when |
+|-----------|-------|-----------|------------|---------|
+| **TokenBucket** | ✅ (configurable) | Smooth | ✅ (Redis) | APIs with burst tolerance |
+| **LeakyBucket** | ❌ (none) | Constant | ❌ | Connection pools, concurrency gates |
+| **FixedWindow** | ❌ (2x at edge) | Stepped | ✅ (Redis) | Simple quotas, dashboards |
+| **SlidingWindow** | ❌ (exact) | Exact | ✅ (Redis) | Strict SLOs, audit logs |
 
-All three support **sync and async**, **thread-safe**, and ship a **decorator** form.
+All four support **sync and async**, **thread-safe**, and ship a **decorator** form.
 
 ## Usage
 
@@ -41,8 +50,61 @@ if bucket.try_acquire():
 else:
     return 429
 
-# Or block until a token is available:
-bucket.acquire()  # blocks
+bucket.acquire()  # blocks until a token is available
+```
+
+### Leaky bucket — connection pool
+
+```python
+import tiny_rate as tr
+
+lb = tr.LeakyBucket(rate=50, capacity=200)  # 50 conn/s, max 200 concurrent
+
+if lb.try_acquire():
+    conn = get_connection()
+    try:
+        handle(conn)
+    finally:
+        lb.release()
+else:
+    raise RateLimitExceeded(1 / lb.rate)
+```
+
+### Redis — distributed rate limiting
+
+```python
+import tiny_rate as tr
+
+backend = tr.RedisBackend("redis://localhost:6379/0")
+
+# Token bucket in Redis (atomic, across all workers)
+allowed = backend.acquire("user:42", limit=100, window=60.0, algorithm="token")
+
+# Sliding window in Redis (exact across all instances)
+allowed = await backend.aacquire("api:global", limit=1000, window=60.0, algorithm="sliding")
+```
+
+### Prometheus metrics
+
+```python
+import tiny_rate as tr
+
+metrics = tr.RateMetrics()
+bucket = tr.TokenBucket(rate=10, capacity=10)
+
+for req in requests:
+    if bucket.try_acquire():
+        metrics.hit(wait_us=0)
+        handle(req)
+    else:
+        metrics.miss()
+        reject(req)
+
+# Expose on /metrics endpoint
+print(metrics.prometheus())
+# ratelimit_hits_total 982
+# ratelimit_misses_total 18
+# ratelimit_hit_rate 0.982000
 ```
 
 ### Decorator
@@ -84,14 +146,15 @@ await bucket.aacquire(timeout=1.0)  # waits up to 1s
 | Class / function | Description |
 |------------------|-------------|
 | `TokenBucket(rate, capacity)` | Smooth, supports burst |
+| `LeakyBucket(rate, capacity)` | Constant drain, no burst, concurrency gate |
 | `FixedWindow(rate, period)` | Counter per window |
 | `SlidingWindow(rate, period)` | Exact log of recent timestamps |
+| `RedisBackend(redis_url, key)` | Distributed limiter via Redis Lua scripts |
+| `RateMetrics()` | Prometheus-compatible counters |
 | `RateLimitExceeded` | Exception with `.retry_after` |
 | `parse_rate(spec)` | Parse `"N/period"` strings |
 | `limit(spec, algorithm, timeout)` | Sync decorator |
 | `alimit(spec, algorithm, timeout)` | Async decorator |
-
-All classes expose `try_acquire()` (non-blocking), `acquire()` / `aacquire()` (blocking), and `available()` (current tokens).
 
 ## Performance
 
@@ -102,10 +165,9 @@ TokenBucket.try_acquire (saturated)   2.74 µs/op   ~370K ops/s
 TokenBucket.try_acquire (high-rate)   1.39 µs/op   ~720K ops/s
 FixedWindow.try_acquire               0.66 µs/op   ~1.5M ops/s
 SlidingWindow.try_acquire             1.35 µs/op   ~740K ops/s
+LeakyBucket.try_acquire               1.12 µs/op   ~890K ops/s
 parse_rate('100/s')                   0.99 µs/op   ~1.0M ops/s
 ```
-
-For comparison, `asyncio-throttle` is ~3-5x slower on the same workload. `aiolimiter` is comparable but only ships token-bucket + async.
 
 ## Ecosystem
 
@@ -130,9 +192,7 @@ Part of the **tiny-*** zero-dep stack by [OpenClaw](https://github.com/hussain-a
 | [snapdb](https://github.com/hussain-alsaibai/snapdb) | Embedded DB (Python) |
 
 **Total: 18 repos, ~14K LOC, 0 dependencies, ~440 tests.**
-| [tiny-cron](https://github.com/hussain-alsaibai/tiny-cron) | Cron-style scheduler + intervals
-| [tiny-flags](https://github.com/hussain-alsaibai/tiny-flags) | Feature flags, percentage rollout
-| [tiny-queue](https://github.com/hussain-alsaibai/tiny-queue) | Persistent FIFO queue, retries
+
 ## License
 
 MIT © 2026 OpenClaw (hussain-alsaibai)
